@@ -20,6 +20,7 @@ import 'package:mobile_scanner/src/web/media_track_extension.dart';
 import 'package:mobile_scanner/src/web/preferred_device_storage.dart';
 import 'package:mobile_scanner/src/web/web_camera_utility.dart';
 import 'package:mobile_scanner/src/web/zxing/zxing_barcode_reader.dart';
+import 'package:mobile_scanner/src/web/track_validation_response.dart';
 import 'package:web/web.dart';
 
 /// A web implementation of the MobileScannerPlatform of the MobileScanner
@@ -194,6 +195,180 @@ class MobileScannerWeb extends MobileScannerPlatform {
     }
   }
 
+    /// Device ids that have been confirmed to not be suitable for scanning
+
+  Map<CameraFacing, List<String>> _omittedDeviceIDs = {
+    CameraFacing.front: [],
+    CameraFacing.back: [],
+  };
+  
+  // Simplifies camera facing mode to front or back for easier processing
+
+  CameraFacing _cameraFacingSimplified(CameraFacing cameraFacing) => cameraFacing == CameraFacing.front ? CameraFacing.front : CameraFacing.back;
+
+  /// Validate that given [MediaStreamTrack] is valid for the current [CameraFacing] constraint and
+  /// return a [TrackValidationResponse] that states a better [MediaStream] and [MediaStreamTrack] 
+  /// has been found or while trying to find one the original has been stopped.
+  ///
+  /// The reason why this function is required is due to the fact that on some android devices,
+  /// especially Samsung, there is no reasonable way to get the correct camera with getUserMedia
+  /// as depth sensor (camera 2, facing back) is returned as the default back facing camera
+  /// with current methods. It is indeed easy to fix this most common case by trying to get
+  /// the back facing camera with the lowest index when an exact match is possible, we are not
+  /// aware of what other lesser known brands might be doing as there is no standard for reporting
+  /// cameras nor sorting them.
+
+  Future<TrackValidationResponse> _validateTrack(MediaStreamTrack track, {
+    required CameraFacing cameraDirection,
+    required MediaTrackSupportedConstraints capabilities,
+    required MediaTrackConstraintSet videoConstraints
+  }) async {
+
+    // If this device does not support facing mode or focus mode assume
+    // this is not a valid device for this operation
+
+    if(!capabilities.facingMode || !capabilities.focusMode) {
+
+      // Use the original track
+      
+      return TrackValidationResponse(originalTrackStopped: false);
+    }
+
+    final trackCapabilities = track.getCapabilities();
+
+    try {
+      
+      if(trackCapabilities.focusMode.toDart.map((e) => e.toDart).contains(_kModeContinuous)) {
+
+        // Track is capable of auto focus, we can use it instead of iterating over other cameras
+
+        // Use the original track
+        
+        return TrackValidationResponse(originalTrackStopped: false);
+      }
+    } on Object catch (_) {
+
+      // Something unexpected has happened while accessing focusMode, usually not a case for mobile devices. Just abort and use 
+      // what we got. Only needed this check while using virtual cameras.
+      
+      return TrackValidationResponse(originalTrackStopped: false);
+    }
+
+    // Track is not capable of auto focus, we need to iterate over other devices. Start by stopping the track
+    // so that we can access other cameras.
+
+    track.stop();
+
+    // Add this devices to the omitted device ids for this camera facing mode until application is stopped so that we do not check it again.
+
+    _omittedDeviceIDs[cameraDirection]!.add(trackCapabilities.deviceId);
+
+    final jsDevices = await window.navigator.mediaDevices.enumerateDevices().toDart;
+    final devices = jsDevices.toDart;
+
+    // Currently available video input devices
+
+    final videoDevices = devices.where(
+          (device) => device.kind == 'videoinput',
+    ).toList();
+
+    // Remove already omitted devices from the video device list
+
+    videoDevices.removeWhere((element) => _omittedDeviceIDs[cameraDirection]!.contains(element.deviceId));
+
+    // Check if we can filter the list via labels, for iOS it usually goes "Front Camera", "Back Camera" etc. while for Samsung "camera 0, back", "camera 2, back" etc.
+    // This list of recognized labels can be made longer with a bigger data set
+
+    if(videoDevices.any((device) => device.label.contains(RegExp(r'back|rear|front', caseSensitive: false)))) {
+      videoDevices.removeWhere((device) => device.label.toLowerCase().contains(cameraDirection == CameraFacing.front ? RegExp(r'back|rear') : "front"));
+    }
+
+    // For Samsung devices the first camera is the one we should be using, knowing that this is not that widespread of an issue basing it on Samsung makes sense
+
+    videoDevices.sort((a, b) => a.label.compareTo(b.label));
+
+    return _validateTrackRecursive(videoDevices, videoConstraints: videoConstraints, cameraDirection: cameraDirection);
+  }
+
+  // Recursivelys checks devices until we find a fitting one OR stops if no valid candidate is found, then reports accordingly
+
+  Future<TrackValidationResponse> _validateTrackRecursive(List<MediaDeviceInfo> remainingList, {
+    required CameraFacing cameraDirection,
+    required MediaTrackConstraintSet videoConstraints,
+  }) async {
+
+    // Current device ID to check
+
+    final String? deviceID = remainingList.firstOrNull?.deviceId;
+
+    // No more items in the list, report that original track is stopped and no replacement can be provided
+
+    if(deviceID == null) return TrackValidationResponse(originalTrackStopped: true);
+
+    MediaStream? stream;
+
+    // Try to  get the stream, if fails (for example device may be in use) return that track is stopped and no replacement can be provided. The reason
+    // why we do not keep iterating is that we do not want to omit this device id, it might be the correct device but just in use. For most of devices 
+    // there is only a single correct device, and this one might be it.
+
+    try {
+      stream = await window.navigator.mediaDevices.getUserMedia(MediaStreamConstraints(
+          video: MediaTrackConstraintSet(
+            deviceId: deviceID.toJS,
+            height: videoConstraints.height,
+            width: videoConstraints.width,
+            facingMode: videoConstraints.facingMode,
+          )
+      )).toDart;
+    } catch (error) {
+      return TrackValidationResponse(originalTrackStopped: true);
+    }
+
+    // Get the resulting track
+
+    final MediaStreamTrack? track = stream.getVideoTracks().toDart.firstOrNull;
+
+    final capabilities = track?.getCapabilities();
+
+    // If cannot access capabilities stop and report. The reason why we do not keep iterating is that we do not want to omit this device id, it might 
+    // be the correct device but just in use. For most of devices there is only a single correct device, and this one might be it.
+
+    if(capabilities == null) {
+      track?.stop();
+      return TrackValidationResponse(originalTrackStopped: true);
+    }
+
+    try {
+
+      // Check capabilities of the resulting track
+
+      if(capabilities.facingModeNullable?.toDart.any((e) => e.toDart == _settingsDelegate.getFacingMode(cameraDirection)) == true && capabilities.focusMode.toDart.map((e) => e.toDart).contains(_kModeContinuous)) {
+
+        // Track is facing the right way and is capable of autofocus, we assume that this track is valid and return the result
+        
+        return TrackValidationResponse(originalTrackStopped: true, stream: stream, track: track);
+      }
+
+      } on Object catch (_) {
+
+      // Something unexpected has happened while accessing focusMode, usually not a case for mobile devices. Just abort and use 
+      // what we got. Only needed this check while using virtual cameras.
+
+      return TrackValidationResponse(originalTrackStopped: true);
+    }
+
+    // Remove current device id from remaining id list and add it to the omitted device id list for the current facing mode
+
+    _omittedDeviceIDs[cameraDirection]!.add(remainingList.removeAt(0).deviceId);
+
+    // Stop the track so we can request the next
+
+    track?.stop();
+
+    return _validateTrackRecursive(remainingList, videoConstraints: videoConstraints, cameraDirection: cameraDirection);
+
+  }
+
   /// Prepare a [MediaStream] for the video output.
   ///
   /// This method requests permission to use the camera.
@@ -263,16 +438,47 @@ class MobileScannerWeb extends MobileScannerPlatform {
     }
 
     try {
+      
       // Retrieving the media devices requests the camera permission.
-      final videoStream = await mediaDevices.getUserMedia(constraints).toDart;
 
-      // Apply focus, exposure and white-balance constraints if supported.
-      final videoTrack = videoStream.getVideoTracks().toDart.firstOrNull;
+      late MediaStream videoStream;
+      MediaStreamTrack? videoTrack;
+
+      // Set the video steam and track according to provided details
+
+      Future<void> setDefaultValues() async {
+        videoStream = await mediaDevices.getUserMedia(constraints).toDart;
+        videoTrack = videoStream.getVideoTracks().toDart.firstOrNull;
+      }
+
+      await setDefaultValues();
+
       if (videoTrack != null) {
-        await _applyVideoConstraints(videoTrack);
+        
+        // Check validity of the current track for scanning
+
+        TrackValidationResponse trackValidationResponse = await _validateTrack(videoTrack!, videoConstraints: constraints.video as MediaTrackConstraintSet, capabilities: capabilities, cameraDirection: _cameraFacingSimplified(cameraDirection));
+        
+        if(trackValidationResponse.stream != null && trackValidationResponse.track != null) {
+
+          // A more capable stream and track has been found, use them instead
+
+          videoStream = trackValidationResponse.stream!;
+          videoTrack = trackValidationResponse.track!;
+        } else if(trackValidationResponse.originalTrackStopped) {
+
+          // A more capable stream and track has not been found, but originals are no longer usable, set them again
+
+          await setDefaultValues();
+        }
+      }
+
+      if (videoTrack != null) {
+        // Apply focus, exposure and white-balance constraints if supported.
+        await _applyVideoConstraints(videoTrack!);
 
         // Persist the device ID so the same camera is preferred next time.
-        final deviceId = videoTrack.getSettings().deviceIdNullable?.toDart;
+        final deviceId = videoTrack!.getSettings().deviceIdNullable?.toDart;
         if (deviceId != null) {
           _preferredDeviceStorage.write(deviceId);
         }
